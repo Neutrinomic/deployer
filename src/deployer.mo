@@ -19,6 +19,7 @@ import Debug "mo:base/Debug";
 
 actor class Self() = this {
 
+    let cycleOps = Principal.fromText("5vdms-kaaaa-aaaap-aa3uq-cai");
 
     // DID here, will need to be refreshed when it changes
     // https://github.com/dfinity/ic-js/blob/b037fe18467d85f9f59716847c32e4ce1a4d5b8e/packages/ledger-icrc/candid/icrc_ledger.did#L128
@@ -29,7 +30,7 @@ actor class Self() = this {
 
     type Can = {
         canister_id : Principal;
-        initarg_request : InitArgsRequested;
+        initarg_request : ReqArgsIncluded;
     };
 
     type Account = {
@@ -40,30 +41,17 @@ actor class Self() = this {
         canisters : [Can];
     };
 
-    /*
-    Example meta:
-
-    record {
-      "icrc1:logo";
-      variant {
-        Text = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAKAAAACgCAYAAACLz2ctAAAAAXNSR0IB2cksfwAAAAlwSFlzAAALEwAACxMBAJqcGAAAKIBJREFUeJztnXd8FNX6/73fe3/fnyh=="
-      };
-    };
-    record { "icrc1:decimals"; variant { Nat = 8 : nat } };
-    record { "icrc1:name"; variant { Text = "Neutrinite" } };
-    record { "icrc1:symbol"; variant { Text = "NTN" } };
-    record { "icrc1:fee"; variant { Nat = 10_000 : nat } };
-    record { "icrc1:max_memo_length"; variant { Nat = 32 : nat } };
-    */
-
-    public type InitArgsRequested = {
+    type ReqArgsIncluded = {
         token_symbol : Text; // max 7 chars
         transfer_fee : Nat;
         token_name : Text;
-        metadata : [(Text, Ledger.MetadataValue)]; // needs to be fixed
         minting_account : Ledger.Account;
         initial_balances : [(Ledger.Account, Nat)];
         fee_collector_account : ?Ledger.Account;
+    };
+
+    public type InitArgsRequested = ReqArgsIncluded and {
+        logo: Text;
     };
 
     public type InitArgsSimplified = InitArgsRequested and {
@@ -71,6 +59,7 @@ actor class Self() = this {
         maximum_number_of_accounts : ?Nat64; //28_000_000
         accounts_overflow_trim_quantity : ?Nat64; // 100_000
         feature_flags : ?{ icrc2 : Bool };
+        metadata : [(Text, Ledger.MetadataValue)]; // needs to be fixed
     };
 
     stable let canisters = Map.new<Principal, Account>();
@@ -84,15 +73,17 @@ actor class Self() = this {
             sns_governance_canister_id = null;
         });
 
-        ignore Timer.setTimer(#seconds(3600 * 24), get_upgrade_steps);
-
         label add_steps for (step in rez.steps.vals()) {
             if (step.version == starting_at) continue add_steps;
             Vector.add(steps, step);
         };
     };
 
-    ignore Timer.setTimer(#seconds 1, get_upgrade_steps);
+    // This has to be called manually after checking if ledger init params changed
+    public shared({caller}) func refresh_upgrade_steps() : async () {
+        assert Principal.isController(caller);
+        await get_upgrade_steps();
+    };
 
     public query ({ caller }) func get_steps() : async [SNSWasm.ListUpgradeStep] {
         Vector.toArray(steps);
@@ -104,12 +95,12 @@ actor class Self() = this {
             Cycles.add(4_000_000_000_000);
             let { canister_id } = await ic.create_canister({
                 settings = ?{
-                    controllers = ?[Principal.fromActor(this)];
-                    freezing_threshold = ?2_000_000_000_000;
-                    memory_allocation = ?1000000000; // 1gb
+                    controllers = ?[Principal.fromActor(this), cycleOps];
+                    freezing_threshold = ?259200; // 3 days
+                    memory_allocation = null;
                     compute_allocation = null;
-                    reserved_cycles_limit = ?0;
-                }:?IC.canister_settings;
+                    reserved_cycles_limit = null;
+                };
             sender_canister_version = null});
 
             canister_id;
@@ -153,6 +144,8 @@ actor class Self() = this {
 
         if (Text.size(req_args.token_symbol) > 7) return #err("Token symbol too long");
         if (Text.size(req_args.token_name) > 32) return #err("Token name too long");
+        if (Text.size(req_args.logo) < 100) return #err("Logo too small");
+        if (Text.size(req_args.logo) > 30000) return #err("Logo has to be at most 30000 chars encoded");
 
         let init_args : InitArgsSimplified = {
             req_args with
@@ -160,6 +153,7 @@ actor class Self() = this {
             maximum_number_of_accounts = ?28_000_000 : ?Nat64;
             accounts_overflow_trim_quantity = ?100_000 : ?Nat64;
             feature_flags = ?{ icrc2 = true };
+            metadata= [("icrc1:logo", #Text(req_args.logo))];
         };
 
         let ?last_version = Vector.last(steps).version else return #err("No upgrade steps available");
