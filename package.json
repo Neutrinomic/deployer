@@ -1,0 +1,15 @@
+{
+  "name": "ledger_deployer",
+  "version": "1.0.0",
+  "description": "",
+  "main": "fix.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@infu/icblast": "^2.0.46"
+  }
+}

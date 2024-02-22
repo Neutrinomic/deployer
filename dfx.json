@@ -1,0 +1,13 @@
+{
+  "canisters": {
+    "deployer": {
+      "main": "src/deployer.mo",
+      "type": "motoko"
+    }
+  },
+  "defaults": {
+    "build": {
+      "packtool": "mops sources"
+    }
+  }
+}
