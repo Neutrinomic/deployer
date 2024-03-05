@@ -86,17 +86,6 @@ module {
     headers : [(Text, Text)];
     status_code : Nat16;
   };
-
-  public type ArchiveOptions = {
-      num_blocks_to_archive : Nat64;
-      max_transactions_per_response : ?Nat64;
-      trigger_threshold : Nat64;
-      max_message_size_bytes : ?Nat64;
-      cycles_for_archive_creation : ?Nat64;
-      node_max_memory_size_bytes : ?Nat64;
-      controller_id : Principal;
-    };
-
   public type InitArgs = {
     decimals : ?Nat8;
     token_symbol : Text;
@@ -107,7 +96,16 @@ module {
     maximum_number_of_accounts : ?Nat64;
     accounts_overflow_trim_quantity : ?Nat64;
     fee_collector_account : ?Account;
-    archive_options : ArchiveOptions;
+    archive_options : {
+      num_blocks_to_archive : Nat64;
+      max_transactions_per_response : ?Nat64;
+      trigger_threshold : Nat64;
+      more_controller_ids : ?[Principal];
+      max_message_size_bytes : ?Nat64;
+      cycles_for_archive_creation : ?Nat64;
+      node_max_memory_size_bytes : ?Nat64;
+      controller_id : Principal;
+    };
     max_memo_length : ?Nat16;
     token_name : Text;
     feature_flags : ?FeatureFlags;

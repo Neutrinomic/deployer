@@ -16,21 +16,51 @@ import Nat64 "mo:base/Nat64";
 import Text "mo:base/Text";
 import Error "mo:base/Error";
 import Debug "mo:base/Debug";
+import ICRCLedger "./services/icrc_ledger"; // used for payment only
 
 actor class Self() = this {
+    let NTN_Install_Fee = 5_0000_0000;
+    let CYCLES_FOR_INSTALL = 50_000_000_000_000;
+    // ---
+    let MIN_CYCLES_IN_DEPLOYER = 70_000_000_000_000;
 
     let cycleOps = Principal.fromText("5vdms-kaaaa-aaaap-aa3uq-cai");
+
 
     // DID here, will need to be refreshed when it changes
     // https://github.com/dfinity/ic-js/blob/b037fe18467d85f9f59716847c32e4ce1a4d5b8e/packages/ledger-icrc/candid/icrc_ledger.did#L128
     private let ic : IC.Self = actor ("aaaaa-aa");
     private let snswasm : SNSWasm.Self = actor ("qaa6y-5yaaa-aaaaa-aaafa-cai");
 
-    stable let steps = Vector.new<SNSWasm.ListUpgradeStep>();
+    stable let steps = Vector.new<SNSWasm.SnsVersion>();
+
+    let NTN_ledger_id = Principal.fromText("f54if-eqaaa-aaaaq-aacea-cai");
+    let NTN_ledger = actor (Principal.toText(NTN_ledger_id)) : ICRCLedger.Self;
+    let NTN_burn_account:ICRCLedger.Account = { owner = Principal.fromText("eqsml-lyaaa-aaaaq-aacdq-cai"); subaccount = null };
+
+    type ArchiveOptions = {
+      num_blocks_to_archive : Nat64;
+      max_transactions_per_response : ?Nat64;
+      trigger_threshold : Nat64;
+      max_message_size_bytes : ?Nat64;
+      cycles_for_archive_creation : ?Nat64;
+      node_max_memory_size_bytes : ?Nat64;
+      controller_id : Principal;
+      more_controller_ids : ?[Principal];
+    };
 
     type Can = {
         canister_id : Principal;
+        var hash : Blob;
         initarg_request : ReqArgsIncluded;
+        upgradearg : Ledger.UpgradeArgs;
+    };
+
+    type CanShared = {
+        canister_id : Principal;
+        hash : Blob;
+        initarg_request : ReqArgsIncluded;
+        upgradearg : Ledger.UpgradeArgs;
     };
 
     type Account = {
@@ -38,7 +68,7 @@ actor class Self() = this {
     };
 
     type AccountShared = {
-        canisters : [Can];
+        canisters : [CanShared];
     };
 
     type ReqArgsIncluded = {
@@ -65,38 +95,43 @@ actor class Self() = this {
     stable let canisters = Map.new<Principal, Account>();
 
     private func get_upgrade_steps() : async () {
-        let starting_at : ?SNSWasm.SnsVersion = if (Vector.size(steps) == 0) null else Vector.last(steps).version;
+        
 
         let rez = await snswasm.list_upgrade_steps({
-            limit = 100;
-            starting_at;
+            limit = 500;
+            starting_at = null;
             sns_governance_canister_id = null;
         });
 
+        Vector.clear(steps);
         label add_steps for (step in rez.steps.vals()) {
-            if (step.version == starting_at) continue add_steps;
-            Vector.add(steps, step);
+            ignore do ? { Vector.add(steps, step.version!); }
         };
     };
 
     // This has to be called manually after checking if ledger init params changed
+    // The refresher principal can only trigger retrieval of new steps from SNSW
+    // This is done after checking if the ledger init params changed
+    // If no checks are done and it's automatic, this could cause new ledger installs to fail
+    // and charge fees while not delivering ledgers
+    let refresher = Principal.fromText("vwng4-j5dgs-e5kv2-ofyq2-hc4be-7u2fn-mmncn-u7dhj-nzkyq-vktfa-xqe");
     public shared({caller}) func refresh_upgrade_steps() : async () {
-        assert Principal.isController(caller);
+        assert (caller == refresher);
         await get_upgrade_steps();
     };
 
-    public query ({ caller }) func get_steps() : async [SNSWasm.ListUpgradeStep] {
+    public query ({ caller }) func get_steps() : async [SNSWasm.SnsVersion] {
         Vector.toArray(steps);
     };
 
     private func create_canister() : async Principal {
         try {
             // Create canister
-            Cycles.add(4_000_000_000_000);
+            Cycles.add(CYCLES_FOR_INSTALL);
             let { canister_id } = await ic.create_canister({
                 settings = ?{
                     controllers = ?[Principal.fromActor(this), cycleOps];
-                    freezing_threshold = ?259200; // 3 days
+                    freezing_threshold = ?9331200; // 108 days
                     memory_allocation = null;
                     compute_allocation = null;
                     reserved_cycles_limit = null;
@@ -112,9 +147,11 @@ actor class Self() = this {
 
     public query ({ caller }) func get_account() : async Result.Result<AccountShared, Text> {
         assert Principal.isController(caller);
-        let ?acc = Map.get(canisters, phash, caller) else return #err("No canister found");
+        let ?acc = Map.get(canisters, phash, caller) else return #err("No account found");
         #ok({
-            canisters = Vector.toArray(acc.canisters);
+            canisters = Array.map<Can,CanShared>(Vector.toArray(acc.canisters), func(x) {
+                { canister_id = x.canister_id; hash = x.hash; initarg_request = x.initarg_request; upgradearg = x.upgradearg }
+            });
         });
     };
 
@@ -122,6 +159,8 @@ actor class Self() = this {
         canister_id : Principal;
         caller : Principal;
         initarg_request : InitArgsRequested;
+        upgradearg : Ledger.UpgradeArgs;
+        hash: Blob;
     }) : () {
 
         let account = switch (Map.get(canisters, phash, caller)) {
@@ -135,12 +174,63 @@ actor class Self() = this {
             };
         };
 
-        Vector.add(account.canisters, { canister_id; initarg_request });
+        Vector.add(account.canisters, { canister_id; initarg_request; upgradearg; var hash });
     };
 
-    public shared ({ caller }) func install(req_args : InitArgsRequested) : async Result.Result<Principal, Text> {
+    // A caller can trigger ledger upgrade at any time, but only to NNS blessed ledger versions
+    // They can't change the parameters
+    public shared ({caller}) func upgrade(ledger_id : Principal) : async Result.Result<(), Text> {
+        let ?acc = Map.get(canisters, phash, caller) else return #err("No account found");
+        var found:?Can = null;
+        label search for (can in Vector.vals(acc.canisters)) {
+            if (can.canister_id == ledger_id) {
+                found := ?can;
+                break search;
+            };
+        };
+        let ?can = found else return #err("No canister found");
 
-        assert Principal.isController(caller);
+        // find next upgrade step
+        var next_step: ?SNSWasm.SnsVersion = null;
+        var found_current : Bool = false;
+
+        label search for (step in Vector.vals(steps)) {
+            if (Blob.compare(step.ledger_wasm_hash, can.hash) == #equal) {
+                found_current := true;
+            };
+            if ((found_current == true) and (Blob.compare(step.ledger_wasm_hash, can.hash) != #equal)) {
+                next_step := ?step;
+                break search;
+            };
+        };
+        let ?ver = next_step else return #err("No next step found");
+        let wasm_resp = await snswasm.get_wasm({ hash = ver.ledger_wasm_hash });
+        let ?wasm_ver = wasm_resp.wasm else return #err("No blessed wasm available");
+        let wasm = wasm_ver.wasm;
+        
+        let uarg:Ledger.UpgradeArgs = can.upgradearg;
+
+        let args : Ledger.LedgerArg = #Upgrade(?uarg);
+        try {
+            await ic.install_code({
+                arg = to_candid(args);
+                wasm_module = wasm;
+                mode = #upgrade(null);
+                canister_id = can.canister_id;
+                sender_canister_version = null;
+            });
+        } catch (e) {
+            return #err("Canister installation failed " # debug_show (Error.message(e)));
+        };
+
+        can.hash := ver.ledger_wasm_hash;
+
+        #ok();
+    };
+
+
+
+    public shared ({ caller }) func install(req_args : InitArgsRequested) : async Result.Result<Principal, Text> {
 
         if (Text.size(req_args.token_symbol) > 7) return #err("Token symbol too long");
         if (Text.size(req_args.token_name) > 32) return #err("Token name too long");
@@ -156,11 +246,11 @@ actor class Self() = this {
             metadata= [("icrc1:logo", #Text(req_args.logo))];
         };
 
-        let ?last_version = Vector.last(steps).version else return #err("No upgrade steps available");
-        let last_ledger_hash = last_version.ledger_wasm_hash;
+        let version = Vector.get(steps, Vector.size(steps) - 0:Nat);
+        let inst_ledger_hash = version.ledger_wasm_hash;
 
         // Get latest wasm
-        let wasm_resp = await snswasm.get_wasm({ hash = last_ledger_hash });
+        let wasm_resp = await snswasm.get_wasm({ hash = inst_ledger_hash });
         let ?wasm_ver = wasm_resp.wasm else return #err("No blessed wasm available");
         let wasm = wasm_ver.wasm;
 
@@ -168,14 +258,15 @@ actor class Self() = this {
         // Ledgers won't show some of its options, so we will not allow them to be set, which will guarantee they are good.
         // Settings same as SNS ledgers - https://github.com/dfinity/ic/blob/8b2d48ca3571d5c09834cba4f90aa2153d88fbe8/rs/sns/init/src/lib.rs#L662
 
-        let archive_options : Ledger.ArchiveOptions = {
+        let archive_options : ArchiveOptions = {
             num_blocks_to_archive = 1000; /// The number of blocks to archive when trigger threshold is exceeded
             trigger_threshold = 2000; /// The number of blocks which, when exceeded, will trigger an archiving operation.
             node_max_memory_size_bytes = ?(1024 * 1024 * 1024);
             max_message_size_bytes = ?(128 * 1024);
-            cycles_for_archive_creation = ?10_000_000_000_000;
+            cycles_for_archive_creation = ?20_000_000_000_000;
             controller_id = Principal.fromActor(this);
             max_transactions_per_response = null;
+            more_controller_ids = ?[Principal.fromActor(this)];
         };
 
         let args : Ledger.LedgerArg = #Init({
@@ -183,6 +274,30 @@ actor class Self() = this {
             archive_options;
             max_memo_length = ?80 : ?Nat16;
         });
+
+        let upgradearg : Ledger.UpgradeArgs = {
+            token_symbol = ?req_args.token_symbol;
+            transfer_fee = ?req_args.transfer_fee;
+            metadata = ?init_args.metadata;
+            maximum_number_of_accounts = init_args.maximum_number_of_accounts;
+            accounts_overflow_trim_quantity = init_args.accounts_overflow_trim_quantity;
+            max_memo_length = ?80;
+            token_name = ?req_args.token_name;
+            feature_flags = init_args.feature_flags;
+            change_fee_collector = ?(switch(init_args.fee_collector_account) {
+                case (?acc) #SetTo(acc);
+                case (null) #Unset;
+            });
+        };
+
+        // Check if this canister has enough cycles
+        let balance = Cycles.balance();
+        if (balance < CYCLES_FOR_INSTALL + MIN_CYCLES_IN_DEPLOYER) return #err("Not enough cycles in deployer");
+
+        if (not Principal.isController(caller)) switch (await NTN_ledger.icrc2_transfer_from({ from = { owner = caller; subaccount = null }; spender_subaccount = null; to = NTN_burn_account; fee = null; memo = null; from_subaccount = null; created_at_time = null; amount = NTN_Install_Fee })) {
+            case (#Ok(_)) ();
+            case (#Err(e)) return #err("NTN payment error: " # debug_show(e));
+        };
 
         let canister_id = await create_canister();
 
@@ -203,10 +318,16 @@ actor class Self() = this {
             canister_id;
             caller;
             initarg_request = init_args;
+            hash = inst_ledger_hash;
+            upgradearg = upgradearg;
         });
 
         #ok(canister_id);
 
     };
 
+
+    public func canister_status(request : IC.canister_status_args) : async IC.canister_status_result {
+        await ic.canister_status(request)
+    }
 };
