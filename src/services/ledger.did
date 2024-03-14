@@ -17,7 +17,7 @@ type Approve = record {
   expected_allowance : opt nat;
   expires_at : opt Timestamp;
   spender : Account;
-};
+}; 
 type ApproveArgs = record {
   fee : opt nat;
   memo : opt blob;
@@ -47,6 +47,7 @@ type HttpRequest = record {
   body : blob;
   headers : vec record { text; text };
 };
+
 type HttpResponse = record {
   body : blob;
   headers : vec record { text; text };

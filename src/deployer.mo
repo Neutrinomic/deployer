@@ -17,9 +17,10 @@ import Text "mo:base/Text";
 import Error "mo:base/Error";
 import Debug "mo:base/Debug";
 import ICRCLedger "./services/icrc_ledger"; // used for payment only
+import Nat8 "mo:base/Nat8";
 
 actor class Self() = this {
-    let NTN_Install_Fee = 5_0000_0000;
+    let ICP_Install_Fee = 7_0000_0000 - 1_0000;
     let CYCLES_FOR_INSTALL = 50_000_000_000_000;
     // ---
     let MIN_CYCLES_IN_DEPLOYER = 70_000_000_000_000;
@@ -34,9 +35,9 @@ actor class Self() = this {
 
     stable let steps = Vector.new<SNSWasm.SnsVersion>();
 
-    let NTN_ledger_id = Principal.fromText("f54if-eqaaa-aaaaq-aacea-cai");
-    let NTN_ledger = actor (Principal.toText(NTN_ledger_id)) : ICRCLedger.Self;
-    let NTN_burn_account:ICRCLedger.Account = { owner = Principal.fromText("eqsml-lyaaa-aaaaq-aacdq-cai"); subaccount = null };
+    let ICP_ledger_id = Principal.fromText("ryjl3-tyaaa-aaaaa-aaaba-cai");
+    let ICP_ledger = actor (Principal.toText(ICP_ledger_id)) : ICRCLedger.Self;
+    let ICP_treasury_account : ICRCLedger.Account = {owner = Principal.fromText("eqsml-lyaaa-aaaaq-aacdq-cai"); subaccount = null};
 
     type ArchiveOptions = {
       num_blocks_to_archive : Nat64;
@@ -146,7 +147,7 @@ actor class Self() = this {
 
 
     public query ({ caller }) func get_account() : async Result.Result<AccountShared, Text> {
-        assert Principal.isController(caller);
+        
         let ?acc = Map.get(canisters, phash, caller) else return #err("No account found");
         #ok({
             canisters = Array.map<Can,CanShared>(Vector.toArray(acc.canisters), func(x) {
@@ -243,10 +244,12 @@ actor class Self() = this {
             maximum_number_of_accounts = ?28_000_000 : ?Nat64;
             accounts_overflow_trim_quantity = ?100_000 : ?Nat64;
             feature_flags = ?{ icrc2 = true };
-            metadata= [("icrc1:logo", #Text(req_args.logo))];
+            metadata= [
+                ("icrc1:logo", #Text(req_args.logo))
+                ];
         };
 
-        let version = Vector.get(steps, Vector.size(steps) - 0:Nat);
+        let version = Vector.get(steps, Vector.size(steps) - 1:Nat);
         let inst_ledger_hash = version.ledger_wasm_hash;
 
         // Get latest wasm
@@ -266,7 +269,7 @@ actor class Self() = this {
             cycles_for_archive_creation = ?20_000_000_000_000;
             controller_id = Principal.fromActor(this);
             max_transactions_per_response = null;
-            more_controller_ids = ?[Principal.fromActor(this)];
+            more_controller_ids = null;
         };
 
         let args : Ledger.LedgerArg = #Init({
@@ -294,9 +297,15 @@ actor class Self() = this {
         let balance = Cycles.balance();
         if (balance < CYCLES_FOR_INSTALL + MIN_CYCLES_IN_DEPLOYER) return #err("Not enough cycles in deployer");
 
-        if (not Principal.isController(caller)) switch (await NTN_ledger.icrc2_transfer_from({ from = { owner = caller; subaccount = null }; spender_subaccount = null; to = NTN_burn_account; fee = null; memo = null; from_subaccount = null; created_at_time = null; amount = NTN_Install_Fee })) {
+        if (not Principal.isController(caller)) switch (await ICP_ledger.icrc1_transfer({ 
+            to = ICP_treasury_account; 
+            fee = null; 
+            memo = null; 
+            from_subaccount = ?callerSubaccount(caller); 
+            created_at_time = null; 
+            amount = ICP_Install_Fee })) {
             case (#Ok(_)) ();
-            case (#Err(e)) return #err("NTN payment error: " # debug_show(e));
+            case (#Err(e)) return #err("ICP payment error: " # debug_show(e));
         };
 
         let canister_id = await create_canister();
@@ -329,5 +338,39 @@ actor class Self() = this {
 
     public func canister_status(request : IC.canister_status_args) : async IC.canister_status_result {
         await ic.canister_status(request)
+    };
+
+    private func callerSubaccount(p : Principal) : Blob {
+        let a = Array.init<Nat8>(32, 0);
+        let pa = Principal.toBlob(p);
+        a[0] := Nat8.fromNat(pa.size());
+
+        var pos = 1;
+        for (x in pa.vals()) {
+                a[pos] := x;
+                pos := pos + 1;
+            };
+
+        Blob.fromArray(Array.freeze(a));
+    };
+
+    public shared({caller}) func refund(to: Ledger.Account) : async () {
+        let from :Ledger.Account = {
+            owner = Principal.fromActor(this);
+            subaccount = ?callerSubaccount(caller);
+        };
+        let balance = await ICP_ledger.icrc1_balance_of(from);
+
+        switch(await ICP_ledger.icrc1_transfer({
+            to; 
+            fee = null; 
+            memo = null; 
+            from_subaccount = from.subaccount; 
+            created_at_time = null; 
+            amount = balance - 10_000
+            })) {
+            case (#Ok(_)) ();
+            case (#Err(e)) return Debug.trap("ICP payment error: " # debug_show(e));
+        };
     }
 };
