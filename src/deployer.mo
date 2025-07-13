@@ -26,7 +26,11 @@ actor class Self() = this {
     let MIN_CYCLES_IN_DEPLOYER = 70_000_000_000_000;
 
     let cycleOps = Principal.fromText("5vdms-kaaaa-aaaap-aa3uq-cai");
+    let cycleOps_new = Principal.fromText("cpbhu-5iaaa-aaaad-aalta-cai");
 
+    // Only admins can install new ledgers
+    // They can't change the parameters of the ledgers however or do anything else but install new ledgers and send cycles
+    let admin_id = Principal.fromText("vwng4-j5dgs-e5kv2-ofyq2-hc4be-7u2fn-mmncn-u7dhj-nzkyq-vktfa-xqe");
 
     // DID here, will need to be refreshed when it changes
     // https://github.com/dfinity/ic-js/blob/b037fe18467d85f9f59716847c32e4ce1a4d5b8e/packages/ledger-icrc/candid/icrc_ledger.did#L128
@@ -111,18 +115,46 @@ actor class Self() = this {
     };
 
     // This has to be called manually after checking if ledger init params changed
-    // The refresher principal can only trigger retrieval of new steps from SNSW
+    // The admin principal can only trigger retrieval of new steps from SNSW
     // This is done after checking if the ledger init params changed
     // If no checks are done and it's automatic, this could cause new ledger installs to fail
     // and charge fees while not delivering ledgers
-    let refresher = Principal.fromText("vwng4-j5dgs-e5kv2-ofyq2-hc4be-7u2fn-mmncn-u7dhj-nzkyq-vktfa-xqe");
     public shared({caller}) func refresh_upgrade_steps() : async () {
-        assert (caller == refresher);
+        assert (caller == admin_id);
         await get_upgrade_steps();
     };
 
     public query ({ caller }) func get_steps() : async [SNSWasm.SnsVersion] {
         Vector.toArray(steps);
+    };
+
+    // When Cycleops changes, we can set them again, also setting controllers of archives as well
+    public shared({caller}) func set_controllers(canister_id : Principal) : async () {
+        assert (caller == admin_id);
+        await ic.update_settings({
+            canister_id;
+            settings = {
+                controllers = ?[Principal.fromActor(this), cycleOps, cycleOps_new];
+                freezing_threshold = ?9331200; // 108 days
+                memory_allocation = null;
+                compute_allocation = null;
+                reserved_cycles_limit = null;
+            };
+            sender_canister_version = null;
+        });
+    };
+
+    public shared({caller}) func send_cycles(amount : Nat, to_canister: Principal) : async Result.Result<(), Text> {
+        if (caller != admin_id) return #err("Only admins can send cycles");
+
+        let balance = Cycles.balance();
+
+        if (balance < amount + 5 * MIN_CYCLES_IN_DEPLOYER) return #err("Need to leave at least 5 * MIN_CYCLES_IN_DEPLOYER cycles in deployer");
+   
+        Cycles.add<system>(amount);
+        await ic.deposit_cycles({ canister_id = to_canister });
+
+        #ok();
     };
 
     private func create_canister() : async Principal {
@@ -131,7 +163,7 @@ actor class Self() = this {
             Cycles.add(CYCLES_FOR_INSTALL);
             let { canister_id } = await ic.create_canister({
                 settings = ?{
-                    controllers = ?[Principal.fromActor(this), cycleOps];
+                    controllers = ?[Principal.fromActor(this), cycleOps, cycleOps_new];
                     freezing_threshold = ?9331200; // 108 days
                     memory_allocation = null;
                     compute_allocation = null;
@@ -232,7 +264,7 @@ actor class Self() = this {
 
 
     public shared ({ caller }) func install(req_args : InitArgsRequested) : async Result.Result<Principal, Text> {
-
+        if (caller != admin_id) return #err("Only admins can install new ledgers");
         if (Text.size(req_args.token_symbol) > 7) return #err("Token symbol too long");
         if (Text.size(req_args.token_name) > 32) return #err("Token name too long");
         if (Text.size(req_args.logo) < 100) return #err("Logo too small");
@@ -297,16 +329,16 @@ actor class Self() = this {
         let balance = Cycles.balance();
         if (balance < CYCLES_FOR_INSTALL + MIN_CYCLES_IN_DEPLOYER) return #err("Not enough cycles in deployer");
 
-        if (not Principal.isController(caller)) switch (await ICP_ledger.icrc1_transfer({ 
-            to = ICP_treasury_account; 
-            fee = null; 
-            memo = null; 
-            from_subaccount = ?callerSubaccount(caller); 
-            created_at_time = null; 
-            amount = ICP_Install_Fee })) {
-            case (#Ok(_)) ();
-            case (#Err(e)) return #err("ICP payment error: " # debug_show(e));
-        };
+        // if (not Principal.isController(caller)) switch (await ICP_ledger.icrc1_transfer({ 
+        //     to = ICP_treasury_account; 
+        //     fee = null; 
+        //     memo = null; 
+        //     from_subaccount = ?callerSubaccount(caller); 
+        //     created_at_time = null; 
+        //     amount = ICP_Install_Fee })) {
+        //     case (#Ok(_)) ();
+        //     case (#Err(e)) return #err("ICP payment error: " # debug_show(e));
+        // };
 
         let canister_id = await create_canister();
 
